@@ -12,6 +12,7 @@ public with sharing class UserRateTemplateService {
         List<Id> assignmentsToProcess = new List<Id>();
         Map<Id, Id> assignmentToTemplateMap = new Map<Id, Id>();
         Map<Id, Id> assignmentToUserMap = new Map<Id, Id>();
+        Map<Id, String> assignmentToFiscalYearMap = new Map<Id, String>();
 
         for (Rate_Template_Assignment__c newAssignment : newAssignments) {
             Rate_Template_Assignment__c oldAssignment = oldAssignmentMap?.get(newAssignment.Id);
@@ -26,6 +27,7 @@ public with sharing class UserRateTemplateService {
                 if (newAssignment.Active__c && newAssignment.Rate_Template__c != null && newAssignment.User__c != null) {
                     assignmentToTemplateMap.put(newAssignment.Id, newAssignment.Rate_Template__c);
                     assignmentToUserMap.put(newAssignment.Id, newAssignment.User__c);
+                    assignmentToFiscalYearMap.put(newAssignment.Id, newAssignment.Fiscal_Year__c);
                 }
             }
         }
@@ -34,12 +36,27 @@ public with sharing class UserRateTemplateService {
             return;
         }
 
+        // Deduplicate: Track which user/template/fiscalYear combos we've already processed
+        Set<String> processedCombos = new Set<String>();
+
         // Process each assignment
         for (Id assignmentId : assignmentsToProcess) {
             if (assignmentToTemplateMap.containsKey(assignmentId)) {
                 Id userId = assignmentToUserMap.get(assignmentId);
                 Id templateId = assignmentToTemplateMap.get(assignmentId);
-                generateUserRateTiers(userId, templateId);
+                String fiscalYear = assignmentToFiscalYearMap.get(assignmentId);
+
+                // Create unique key for this combo
+                String comboKey = userId + '_' + templateId + '_' + fiscalYear;
+
+                // Only process if we haven't already processed this combo
+                if (!processedCombos.contains(comboKey)) {
+                    generateUserRateTiers(userId, templateId);
+                    processedCombos.add(comboKey);
+                    System.debug('Processed user/template combo: ' + comboKey);
+                } else {
+                    System.debug('Skipping duplicate user/template combo: ' + comboKey);
+                }
             } else {
                 // Assignment is inactive or missing required fields - delete tiers
                 Rate_Template_Assignment__c assignment = newAssignments[0];
@@ -69,14 +86,26 @@ public with sharing class UserRateTemplateService {
         }
 
         // Delete existing User Rate Tiers for this user/fiscal year
+        // Note: Using upsert below as a safety net in case delete doesn't catch all records
         deleteExistingTiers(userId, template.Fiscal_Year__c);
 
+        System.debug('Generating User Rate Tiers for userId: ' + userId + ', fiscal year: ' + template.Fiscal_Year__c);
+
         // Create new User Rate Tiers from template
-        List<User_Rate_Tier__c> userTiers = new List<User_Rate_Tier__c>();
+        // Use Map to prevent duplicates by Unique_Key__c
+        Map<String, User_Rate_Tier__c> userTiersMap = new Map<String, User_Rate_Tier__c>();
         Decimal previousRecurringRate = 0;
         Decimal previousNonRecurringRate = 0;
 
         for (Rate_Template_Tier__c tier : template.Rate_Template_Tiers__r) {
+            String uniqueKey = generateUniqueKey(userId, tier.Tier_Number__c, template.Fiscal_Year__c);
+
+            // Skip if we've already processed this tier number (prevents duplicates)
+            if (userTiersMap.containsKey(uniqueKey)) {
+                System.debug('Warning: Duplicate tier number ' + tier.Tier_Number__c + ' found in template. Skipping duplicate.');
+                continue;
+            }
+
             User_Rate_Tier__c userTier = new User_Rate_Tier__c(
                 User__c = userId,
                 Tier_Number__c = tier.Tier_Number__c,
@@ -86,7 +115,7 @@ public with sharing class UserRateTemplateService {
                 Non_Recurring_Rate__c = tier.Non_Recurring_Rate__c,
                 Fiscal_Year__c = template.Fiscal_Year__c,
                 Source_Template__c = templateId,
-                Unique_Key__c = generateUniqueKey(userId, tier.Tier_Number__c, template.Fiscal_Year__c)
+                Unique_Key__c = uniqueKey
             );
 
             // Calculate rate differences from previous tier
@@ -96,12 +125,13 @@ public with sharing class UserRateTemplateService {
             previousRecurringRate = tier.Recurring_Rate__c;
             previousNonRecurringRate = tier.Non_Recurring_Rate__c;
 
-            userTiers.add(userTier);
+            userTiersMap.put(uniqueKey, userTier);
         }
 
-        // Insert new tiers
-        if (!userTiers.isEmpty()) {
-            insert userTiers;
+        // Upsert tiers (insert new or update existing based on Unique_Key__c)
+        if (!userTiersMap.isEmpty()) {
+            System.debug('Upserting ' + userTiersMap.size() + ' User Rate Tiers');
+            upsert userTiersMap.values() Unique_Key__c;
         }
     }
 
@@ -155,15 +185,23 @@ public with sharing class UserRateTemplateService {
      * Delete existing User Rate Tiers for a user/fiscal year combination
      */
     public static void deleteExistingTiers(Id userId, String fiscalYear) {
+        if (userId == null || String.isBlank(fiscalYear)) {
+            System.debug('DeleteExistingTiers: Invalid parameters - userId: ' + userId + ', fiscalYear: ' + fiscalYear);
+            return;
+        }
+
         List<User_Rate_Tier__c> tiersToDelete = [
-            SELECT Id
+            SELECT Id, Unique_Key__c
             FROM User_Rate_Tier__c
             WHERE User__c = :userId
             AND Fiscal_Year__c = :fiscalYear
         ];
 
+        System.debug('DeleteExistingTiers: Found ' + tiersToDelete.size() + ' tiers to delete for userId: ' + userId + ', fiscalYear: ' + fiscalYear);
+
         if (!tiersToDelete.isEmpty()) {
             delete tiersToDelete;
+            System.debug('DeleteExistingTiers: Successfully deleted ' + tiersToDelete.size() + ' tiers');
         }
     }
 
